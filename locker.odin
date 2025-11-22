@@ -4,7 +4,98 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:c"
+import "core:mem"
+import "base:runtime"
 import x "vendor:x11/xlib"
+
+// PAM bindings
+foreign import pam "system:pam"
+
+pam_handle_t :: distinct rawptr
+pam_message :: struct {
+	msg_style: c.int,
+	msg: cstring,
+}
+pam_response :: struct {
+	resp: cstring,
+	resp_retcode: c.int,
+}
+pam_conv :: struct {
+	conv: proc "c" (num_msg: c.int, msg: ^[^]pam_message, resp: ^^pam_response, appdata_ptr: rawptr) -> c.int,
+	appdata_ptr: rawptr,
+}
+
+PAM_PROMPT_ECHO_OFF :: 1
+PAM_PROMPT_ECHO_ON :: 2
+PAM_ERROR_MSG :: 3
+PAM_TEXT_INFO :: 4
+PAM_SUCCESS :: 0
+
+@(default_calling_convention="c")
+foreign pam {
+	pam_start :: proc(service_name: cstring, user: cstring, pam_conversation: ^pam_conv, pamh: ^pam_handle_t) -> c.int ---
+	pam_authenticate :: proc(pamh: pam_handle_t, flags: c.int) -> c.int ---
+	pam_end :: proc(pamh: pam_handle_t, status: c.int) -> c.int ---
+}
+
+// Global password storage for PAM callback
+global_password: cstring
+
+pam_conversation_func :: proc "c" (num_msg: c.int, msg: ^[^]pam_message, resp: ^^pam_response, appdata_ptr: rawptr) -> c.int {
+	context = runtime.default_context()
+
+	if num_msg <= 0 {
+		return 1
+	}
+
+	size := int(num_msg) * size_of(pam_response)
+	responses_ptr, err := mem.alloc_bytes(size, align_of(pam_response))
+	if err != nil {
+		return 1
+	}
+	mem.zero(raw_data(responses_ptr), size)
+	responses := ([^]pam_response)(raw_data(responses_ptr))
+
+	messages := msg^
+	for i in 0..<num_msg {
+		if messages[i].msg_style == PAM_PROMPT_ECHO_OFF || messages[i].msg_style == PAM_PROMPT_ECHO_ON {
+			responses[i].resp = global_password
+			responses[i].resp_retcode = 0
+		}
+	}
+
+	resp^ = responses
+	return PAM_SUCCESS
+}
+
+verify_password :: proc(password: string) -> bool {
+	username := os.get_env("USER")
+	if username == "" {
+		username = os.get_env("LOGNAME")
+	}
+	if username == "" {
+		return false
+	}
+
+	password_cstr := strings.clone_to_cstring(password)
+	defer delete(password_cstr)
+	global_password = password_cstr
+
+	conv := pam_conv{
+		conv = pam_conversation_func,
+		appdata_ptr = nil,
+	}
+
+	pamh: pam_handle_t
+	ret := pam_start("login", strings.clone_to_cstring(username), &conv, &pamh)
+	if ret != PAM_SUCCESS {
+		return false
+	}
+	defer pam_end(pamh, ret)
+
+	ret = pam_authenticate(pamh, 0)
+	return ret == PAM_SUCCESS
+}
 
 main :: proc() {
 	display := x.OpenDisplay(nil)
@@ -58,11 +149,6 @@ main :: proc() {
 	password_buffer: [dynamic]u8
 	defer delete(password_buffer)
 
-	correct_password := os.get_env("LOCKER_PASSWORD")
-	if correct_password == "" {
-		correct_password = "password"
-	}
-
 	running := true
 	for running {
 		event: x.XEvent
@@ -84,7 +170,7 @@ main :: proc() {
 
 			if keysym == .XK_Return {
 				password := string(password_buffer[:])
-				if password == correct_password {
+				if verify_password(password) {
 					running = false
 				} else {
 					clear(&password_buffer)
