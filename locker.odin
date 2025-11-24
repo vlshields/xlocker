@@ -78,8 +78,12 @@ verify_password :: proc(password: string) -> bool {
 	}
 
 	password_cstr := strings.clone_to_cstring(password)
-	defer delete(password_cstr)
 	global_password = password_cstr
+	defer delete(password_cstr)
+	defer global_password = nil
+
+	username_cstr := strings.clone_to_cstring(username)
+	defer delete(username_cstr)
 
 	conv := pam_conv{
 		conv = pam_conversation_func,
@@ -87,7 +91,7 @@ verify_password :: proc(password: string) -> bool {
 	}
 
 	pamh: pam_handle_t
-	ret := pam_start("login", strings.clone_to_cstring(username), &conv, &pamh)
+	ret := pam_start("login", username_cstr, &conv, &pamh)
 	if ret != PAM_SUCCESS {
 		return false
 	}
