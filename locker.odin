@@ -170,7 +170,12 @@ main :: proc() {
 
 			if keysym == .XK_Return {
 				password := string(password_buffer[:])
-				if verify_password(password) {
+				// Reject empty passwords
+				if len(password) == 0 {
+					clear(&password_buffer)
+					x.ClearWindow(display, window)
+					x.Flush(display)
+				} else if verify_password(password) {
 					running = false
 				} else {
 					clear(&password_buffer)
