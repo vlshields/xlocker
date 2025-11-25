@@ -4,8 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:c"
-import "core:mem"
-import "base:runtime"
+import "core:c/libc"
 import x "vendor:x11/xlib"
 
 // PAM bindings
@@ -42,24 +41,28 @@ foreign pam {
 global_password: cstring
 
 pam_conversation_func :: proc "c" (num_msg: c.int, msg: ^[^]pam_message, resp: ^^pam_response, appdata_ptr: rawptr) -> c.int {
-	context = runtime.default_context()
-
 	if num_msg <= 0 {
 		return 1
 	}
 
-	size := int(num_msg) * size_of(pam_response)
-	responses_ptr, err := mem.alloc_bytes(size, align_of(pam_response))
-	if err != nil {
+	// PAM will free these with free(), so we must use malloc
+	responses := ([^]pam_response)(libc.calloc(c.size_t(num_msg), size_of(pam_response)))
+	if responses == nil {
 		return 1
 	}
-	mem.zero(raw_data(responses_ptr), size)
-	responses := ([^]pam_response)(raw_data(responses_ptr))
 
 	messages := msg^
 	for i in 0..<num_msg {
 		if messages[i].msg_style == PAM_PROMPT_ECHO_OFF || messages[i].msg_style == PAM_PROMPT_ECHO_ON {
-			responses[i].resp = global_password
+			// PAM will free resp with free(), so we must use malloc
+			pwd_len := libc.strlen(global_password)
+			resp_copy := ([^]c.char)(libc.malloc(pwd_len + 1))
+			if resp_copy == nil {
+				libc.free(responses)
+				return 1
+			}
+			libc.strcpy(resp_copy, global_password)
+			responses[i].resp = cstring(resp_copy)
 			responses[i].resp_retcode = 0
 		}
 	}
@@ -170,7 +173,9 @@ main :: proc() {
 
 		case x.EventType.KeyPress:
 			key_event := event.xkey
-			keysym := x.LookupKeysym(&key_event, 0)
+			buf: [32]u8
+			keysym: x.KeySym
+			count := x.LookupString(&key_event, raw_data(&buf), i32(len(buf)), &keysym, nil)
 
 			if keysym == .XK_Return {
 				password := string(password_buffer[:])
@@ -190,8 +195,8 @@ main :: proc() {
 				if len(password_buffer) > 0 {
 					pop(&password_buffer)
 				}
-			} else if u32(keysym) >= 0x20 && u32(keysym) <= 0x7E {
-				append(&password_buffer, u8(keysym))
+			} else if count > 0 && buf[0] >= 0x20 && buf[0] <= 0x7E {
+				append(&password_buffer, buf[0])
 			}
 
 			// Redraw
