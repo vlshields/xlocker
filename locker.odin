@@ -5,6 +5,8 @@ import "core:os"
 import "core:strings"
 import "core:c"
 import "core:c/libc"
+import "core:time"
+import "core:thread"
 import x "vendor:x11/xlib"
 
 // PAM bindings
@@ -104,6 +106,87 @@ verify_password :: proc(password: string) -> bool {
 	return ret == PAM_SUCCESS
 }
 
+// Grab keyboard with retry logic
+grab_keyboard :: proc(display: ^x.Display, window: x.Window, max_attempts: int = 50) -> bool {
+	for _ in 0..<max_attempts {
+		result := x.GrabKeyboard(display, window, true, x.GrabMode.GrabModeAsync, x.GrabMode.GrabModeAsync, x.CurrentTime)
+		if result == 0 { // GrabSuccess
+			return true
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// Grab pointer with retry logic
+grab_pointer :: proc(display: ^x.Display, window: x.Window, max_attempts: int = 50) -> bool {
+	for _ in 0..<max_attempts {
+		result := x.GrabPointer(display, window, true, x.EventMask{}, x.GrabMode.GrabModeAsync, x.GrabMode.GrabModeAsync, window, 0, x.CurrentTime)
+		if result == 0 { // GrabSuccess
+			return true
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// PAM auth result for thread communication
+PamResult :: struct {
+	done: bool,
+	success: bool,
+}
+
+// Global storage for thread-safe password passing
+global_password_for_thread: [256]u8
+global_password_len: int
+global_pam_result: ^PamResult
+
+// Wrapper for threaded PAM authentication
+pam_auth_thread :: proc(t: ^thread.Thread) {
+	password := string(global_password_for_thread[:global_password_len])
+	global_pam_result.success = verify_password(password)
+	global_pam_result.done = true
+}
+
+// Verify password with timeout
+verify_password_with_timeout :: proc(password: string, timeout_seconds: int = 10) -> bool {
+	if len(password) > 255 {
+		return false
+	}
+
+	// Copy password to global buffer for thread
+	for i in 0..<len(password) {
+		global_password_for_thread[i] = password[i]
+	}
+	global_password_len = len(password)
+
+	result := PamResult{done = false, success = false}
+	global_pam_result = &result
+
+	t := thread.create(pam_auth_thread)
+	if t == nil {
+		// Fallback to direct call if thread creation fails
+		return verify_password(password)
+	}
+	thread.start(t)
+
+	// Wait with timeout
+	deadline := time.now()._nsec + i64(timeout_seconds) * 1_000_000_000
+	for !result.done {
+		if time.now()._nsec > deadline {
+			// Timeout - thread is still running but we give up waiting
+			// Note: thread will continue in background, but we won't deadlock
+			thread.destroy(t)
+			return false
+		}
+		time.sleep(50 * time.Millisecond)
+	}
+
+	thread.join(t)
+	thread.destroy(t)
+	return result.success
+}
+
 main :: proc() {
 	display := x.OpenDisplay(nil)
 	if display == nil {
@@ -146,9 +229,18 @@ main :: proc() {
 	x.MapWindow(display, window)
 	x.RaiseWindow(display, window)
 
-	// Grab keyboard and pointer
-	x.GrabKeyboard(display, window, true, x.GrabMode.GrabModeAsync, x.GrabMode.GrabModeAsync, x.CurrentTime)
-	x.GrabPointer(display, window, true, x.EventMask{}, x.GrabMode.GrabModeAsync, x.GrabMode.GrabModeAsync, window, 0, x.CurrentTime)
+	// Grab keyboard and pointer with retry logic
+	if !grab_keyboard(display, window) {
+		fmt.eprintln("Failed to grab keyboard after retries")
+		x.DestroyWindow(display, window)
+		os.exit(1)
+	}
+	if !grab_pointer(display, window) {
+		fmt.eprintln("Failed to grab pointer after retries")
+		x.UngrabKeyboard(display, x.CurrentTime)
+		x.DestroyWindow(display, window)
+		os.exit(1)
+	}
 
 	gc := x.CreateGC(display, window, x.GCAttributeMask{}, nil)
 	x.SetForeground(display, gc, white)
@@ -157,12 +249,48 @@ main :: proc() {
 	defer delete(password_buffer)
 
 	running := true
-	for running {
-		event: x.XEvent
-		x.NextEvent(display, &event)
+	needs_redraw := true  // Initial draw
 
-		#partial switch event.type {
-		case x.EventType.Expose:
+	for running {
+		// Non-blocking event loop with XPending
+		for x.Pending(display) > 0 {
+			event: x.XEvent
+			x.NextEvent(display, &event)
+
+			#partial switch event.type {
+			case x.EventType.Expose:
+				needs_redraw = true
+
+			case x.EventType.KeyPress:
+				key_event := event.xkey
+				buf: [32]u8
+				keysym: x.KeySym
+				count := x.LookupString(&key_event, raw_data(&buf), i32(len(buf)), &keysym, nil)
+
+				if keysym == .XK_Return {
+					password := string(password_buffer[:])
+					if len(password) == 0 {
+						clear(&password_buffer)
+					} else if verify_password_with_timeout(password) {
+						running = false
+					} else {
+						clear(&password_buffer)
+					}
+					needs_redraw = true
+				} else if keysym == .XK_BackSpace {
+					if len(password_buffer) > 0 {
+						pop(&password_buffer)
+						needs_redraw = true
+					}
+				} else if count > 0 && buf[0] >= 0x20 && buf[0] <= 0x7E {
+					append(&password_buffer, buf[0])
+					needs_redraw = true
+				}
+			}
+		}
+
+		// Draw if needed
+		if needs_redraw {
 			x.ClearWindow(display, window)
 			prompt := "Leave Me Alone. I'm Sleeping "
 			x.DrawString(display, window, gc, screen_width / 2 - 100, screen_height / 2, raw_data(prompt), i32(len(prompt)))
@@ -171,40 +299,12 @@ main :: proc() {
 			defer delete(dots)
 			x.DrawString(display, window, gc, screen_width / 2 - 50, screen_height / 2 + 30, raw_data(dots), i32(len(dots)))
 
-		case x.EventType.KeyPress:
-			key_event := event.xkey
-			buf: [32]u8
-			keysym: x.KeySym
-			count := x.LookupString(&key_event, raw_data(&buf), i32(len(buf)), &keysym, nil)
-
-			if keysym == .XK_Return {
-				password := string(password_buffer[:])
-				// Reject empty passwords
-				if len(password) == 0 {
-					clear(&password_buffer)
-					x.ClearWindow(display, window)
-					x.Flush(display)
-				} else if verify_password(password) {
-					running = false
-				} else {
-					clear(&password_buffer)
-					x.ClearWindow(display, window)
-					x.Flush(display)
-				}
-			} else if keysym == .XK_BackSpace {
-				if len(password_buffer) > 0 {
-					pop(&password_buffer)
-				}
-			} else if count > 0 && buf[0] >= 0x20 && buf[0] <= 0x7E {
-				append(&password_buffer, buf[0])
-			}
-
-			// Redraw
-			fake_expose: x.XEvent
-			fake_expose.type = x.EventType.Expose
-			x.SendEvent(display, window, false, x.EventMask{.Exposure}, &fake_expose)
 			x.Flush(display)
+			needs_redraw = false
 		}
+
+		// Small sleep to avoid busy-waiting
+		time.sleep(10 * time.Millisecond)
 	}
 
 	x.UngrabKeyboard(display, x.CurrentTime)
